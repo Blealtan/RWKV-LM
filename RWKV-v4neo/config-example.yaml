@@ -2,8 +2,9 @@
 seed_everything: true
 trainer:
   # Configure the number of GPU, avaliable on your machine
+  # auto means it will automatically detect and use all GPUs
   accelerator: gpu
-  devices: 1
+  devices: auto
   num_nodes: 1
 
   #
@@ -24,8 +25,7 @@ trainer:
   # For more details see:
   # https://lightning.ai/docs/pytorch/stable/advanced/model_parallel.html#deepspeed-zero-stage-2
   #
-  #!FIXME: currently only deepspeed_stage_1 is supported, due to that deepspeed cannot handle repeated backward hook.
-  strategy: deepspeed_stage_1
+  strategy: deepspeed_stage_2_offload
 
   # Floating point precision for the model, because RWKV is built FOR bf16
   # you should pretty much never change this setting
@@ -213,6 +213,29 @@ model:
   # this should be set as null, for non cuda core GPUs
   torch_set_float32_matmul_precision: 'high'
   # torch_set_float32_matmul_precision: null
+
+  # Back Propagation through time, used to work around training of large context length
+  # beyond what can be supported by the current GPU vram architecture
+  #
+  # This is not 1:1 equivalent to the same training process with the full vram
+  # as the training process is split into multiple segments, part by part.
+  # with limited learnings from the each segment.
+  bptt_learning: true
+
+  # Segmented range to performing backprop learning on
+  # 1 means to apply only for the last segment
+  # -1 means to apply for all segments
+  #
+  # For multi-gpu training, this must be set to 1, due to a known issue
+  # else an exception would be thrown
+  bptt_learning_range: -1
+
+  # Limits the bptt learning only to the "current" chunk
+  # being learned within the learning range. While this reduces the effectiveness
+  # of bptt, it also further reduces vram requirements. 
+  #
+  # This is also known as tbptt (Truncated Back Propagation through time)
+  bptt_truncated_learning: false
 
   # various other settings you probably should leave alone
   grad_cp: true
