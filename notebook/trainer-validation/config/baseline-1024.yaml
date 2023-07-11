@@ -3,7 +3,7 @@ seed_everything: 3941088705
 trainer:
   # Configure the number of GPU, avaliable on your machine
   accelerator: gpu
-  devices: 1
+  devices: auto
   num_nodes: 1
 
   #
@@ -35,7 +35,7 @@ trainer:
   logger:
     class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
-      name: 'infctx-validation-512-segmented (train-ctx=512, data-ctx=1024, bs=12)'
+      name: 'infctx-validation-baseline (train-ctx=1024, data-ctx=1024, bs=10)'
       project: 'RWKV-infctx-validation'
       tags: ['RWKV', 'infctx']
       id: null
@@ -79,7 +79,7 @@ trainer:
       # which will create a `rwkv_model.pth` in the checkpoint directory.
       #
       # Do not use the `zero_to_fp32.py` script as that will have export format issues
-      dirpath: ../checkpoint/trainer-validaiton/infctx-validation-segment-512
+      dirpath: ../checkpoint/trainer-validaiton/infctx-validation-baseline
       filename: null
       
       # Save the top/last K checkpoints
@@ -136,7 +136,7 @@ trainer:
   #
   # You are also recommended to configure this to a large enough number to fully utilize
   # your GPU processing time %, and avoid idle time for the GPU between batches
-  accumulate_grad_batches: 12
+  accumulate_grad_batches: 10
 
   # Various other settings, you probably want to leave alone
   fast_dev_run: false
@@ -189,7 +189,7 @@ model:
   # This allows the training of extreamly large context length (eg. 100k),
   # without eating up too much vram by keeping the training context length
   # to a resonable number sutible to the current GPU setup
-  ctx_len: 512
+  ctx_len: 1024
   
   # Data samples would be cut down to the respective max ctx_len_cutoffs
   # values if its larger then ctx_len. If the data sample is larger then
@@ -235,12 +235,12 @@ model:
   # This is not 1:1 equivalent to the same training process with required vram
   # as the training process is split into multiple segments, part by part.
   # with limited learnings from the previous segment.
-  bptt_learning: true
+  bptt_learning: false
 
   # Segmented range to performing backprop learning on
   # 1 means to apply only for the last segment
   # -1 means to apply for all segments
-  bptt_learning_range: 1
+  bptt_learning_range: -1
 
   # various other settings you probably should leave alone
   grad_cp: true
@@ -325,7 +325,7 @@ data:
   # multi_column_keys: ['instruction', 'input', 'output']
   # multi_column_prefix: ['Instruction:\n', 'Input:\n', 'Output:\n']
   # multi_column_masking: [false, true, false]
-  # multi_column_seperator: '\n\n'
+  # multi_column_separator: '\n\n'
 
   # If processing prompt/completion jsonl pairs, the prompt is masked by default
   # use this flag to disable this default behaviour
@@ -335,5 +335,5 @@ data:
 # Path to the current checkpoint to continue training from
 # Enable this to the last checkpoint after the first run 
 # (if it crash and you want to resume)
-# ckpt_path: ../checkpoint/trainer-validaiton/infctx-validation-dryrun/epoch=0-step=20.ckpt
+# ckpt_path: ../checkpoint/trainer-validaiton/infctx-validation-baseline/epoch=0-step=20.ckpt
 ckpt_path: null

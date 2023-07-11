@@ -2,7 +2,7 @@
 # The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
 ########################################################################################################
 
-import os, math, sys
+import gc, math, os
 from random import randint
 from typing import List, Optional
 
@@ -22,15 +22,113 @@ from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 import deepspeed.runtime.lr_schedules
 import wandb
 
-RWKV_JIT_ON = True
+from torch.utils.cpp_extension import load
 
-if RWKV_JIT_ON:
-    MyModule = torch.jit.ScriptModule
-    MyFunction = torch.jit.script_method
+########################################################################################################
+# JIT / torch compile special handling
+########################################################################################################
+
+# Currently the features we need for torch compile, is avaliable only in
+# 2.1 nightly build (and is expected to be in 2.1 official release)
+#
+# We only enable torch compile, if we either the user has explicitly
+# set it, or we detect that we are running on a 2.1+ build automatically
+from packaging import version
+def is_torch_version_above(required_version):
+    torch_version = version.parse(torch.__version__.split('+')[0])
+    return torch_version >= version.parse(required_version)
+IS_TORCH_2_1 = is_torch_version_above("2.0.9999")
+
+# Get the JIT / torch compile option flags from the environment
+RWKV_JIT_ON        = os.getenv("RWKV_JIT_ON", "1").lower() in ("1", "true", "yes")
+RWKV_TORCH_COMPILE = os.getenv("RWKV_TORCH_COMPILE", f"{IS_TORCH_2_1}").lower() in ("1", "true", "yes")
+RWKV_TORCH_RUN_MODE = None
+
+# We enable JITMod*/Function when supporting torch.jit
+# We use TorchCompile* when supporting torch compile
+# based on the current runtime settings
+if RWKV_TORCH_COMPILE:
+    RWKV_TORCH_RUN_MODE = "torch-compile"
+
+    JITModClass  = nn.Module
+    JITModMethod = lambda x: x
+    JITFunction  = lambda x: x
+
+    # PS: i have tried mode="max-autotune", and mode="reduce-overhead", however they crash
+    #     for now (8th July 2023). I may introduce them in the future once they are stable
+    #
+    #     Additionally, torch.compile has issues with the pytorch.lightning module directly
+    # ---
+
+    # We generally have 2 major options, either we use torch.compile
+    # onto the key top level functions (train, val, test, predict, etc)
+    # and let the compiler handle all the decision making on how to optimize
+    #
+    # However this was found to basically just match JIT level of performance exactly
+    # ---
+    # TCompileMax          = lambda x: x
+    # TCompileBaseline     = lambda x: torch.compile(x, fullgraph=False)
+
+    # Alternatively, we can perform a much more aggressive optimization on critical functions
+    # that we know are compatible with torch.compile(fullgraph=True) - which provides the highest
+    # level of optimization possible with torch.compile
+    # ---
+    TCompileMax        = lambda x: torch.compile(x, fullgraph=True)
+    TCompileBaseline   = lambda x: x
+
+    # ---
+    # Because torch.compile is expected to change overtime, the two options should 
+    # be tested every now and then, for any performance changes
+    #
+    # and we should switch over to the broaded automated approach if its "faster"
+    # ---
+
+    # Used to wrap functions which are **not** torch.compile compatible
+    TCompileDisable    = torch._dynamo.disable
+
+    # The following are known warnings in the nightly build, that can be safely ignored for stable release
+    #
+    # `torch._inductor.utils: [WARNING] DeviceCopy in input program` 
+    # https://discuss.pytorch.org/t/what-can-cause-warning-devicecopy-in-input-program/175566
+
+elif RWKV_JIT_ON:
+    RWKV_TORCH_RUN_MODE = "torch-jit"
+    JITModClass  = torch.jit.ScriptModule
+    JITModMethod = torch.jit.script_method
+    JITFunction  = torch.jit.script
+
+    TCompileMax        = lambda x: x
+    TCompileBaseline   = lambda x: x
+    TCompileDisable    = lambda x: x
 else:
-    MyModule = nn.Module
-    MyFunction = lambda x: x
+    RWKV_TORCH_RUN_MODE = "torch-native"
+    JITModClass  = nn.Module
+    JITModMethod = lambda x: x
+    JITFunction  = lambda x: x
 
+    TCompileMax        = lambda x: x
+    TCompileBaseline   = lambda x: x
+    TCompileDisable    = lambda x: x
+
+print(f"[RWKV.model] Running RWKV model using '{RWKV_TORCH_RUN_MODE}' with torch '{torch.__version__}'")
+
+# ---
+# Isolating out known operations that **does not work** with torch.compile
+# and wrapping them within a torch._dynamo.disable, this is required to get
+# the baseline torc.compile to work
+# ---
+
+@TCompileDisable
+def deepspeed_checkpoint(*args, **kwargs):
+    return deepspeed.checkpointing.checkpoint(*args, **kwargs)
+
+@TCompileDisable
+def wkv_op(time_decay, time_first, k, v, wkv_state):
+    return torch.ops.rwkv.wkv(time_decay, time_first, k, v, wkv_state)
+
+########################################################################################################
+# RWKV: State Blocks
+########################################################################################################
 
 class TimeMixState:
 
@@ -59,6 +157,7 @@ class BlockStateList:
         self.wkv_states = wkv_states
         self.shift_states = shift_states
 
+    # @ TCompileMax (no difference)
     @staticmethod
     def create(N, B, C, device, dtype):
         result = BlockStateList.empty(N, B, C, device, dtype)
@@ -67,6 +166,7 @@ class BlockStateList:
         result.shift_states[:] = 0
         return result
 
+    # @ TCompileMax (no difference)
     @staticmethod
     def empty(N, B, C, device, dtype):
         wkv_states = torch.empty((N, B, C, 3),
@@ -85,15 +185,11 @@ class BlockStateList:
         self.wkv_states[layer] = state.time_mix_state.wkv_state
         self.shift_states[layer, 1] = state.channel_mix_state.shift_state
 
-
-from torch.utils.cpp_extension import load
-
 ########################################################################################################
 # RWKV: RWKV Time-mix + RWKV Channel-mix
 ########################################################################################################
 
-
-class RWKV_TimeMix(MyModule):
+class RWKV_TimeMix(JITModClass):
 
     def __init__(self, layer_id, n_layer, n_embd, dim_att):
         super().__init__()
@@ -132,8 +228,9 @@ class RWKV_TimeMix(MyModule):
         self.receptance = nn.Linear(n_embd, dim_att, bias=False)
         self.output = nn.Linear(dim_att, n_embd, bias=False)
 
-    @MyFunction
-    def forward(self, x, last_state: TimeMixState):
+    @JITModMethod
+    @TCompileMax
+    def _forward_kvsr(self, x, last_state: TimeMixState):
         # Mix x with the previous timestep to produce xk, xv, xr
         xx = torch.concat((last_state.shift_state.unsqueeze(1), x[:, :-1]),
                           dim=1)
@@ -147,15 +244,26 @@ class RWKV_TimeMix(MyModule):
 
         sr = torch.sigmoid(r)
 
-        y, new_wkv_state = torch.ops.rwkv.wkv(self.time_decay, self.time_first,
-                                              k, v, last_state.wkv_state)
-        return self.output(sr * y), TimeMixState(x[:, -1], new_wkv_state)
+        return k, v, sr
+
+    @JITModMethod
+    @TCompileMax
+    def _forward_out(self, sr, y, x_l, new_wkv_state):
+        return self.output(sr * y), TimeMixState(x_l, new_wkv_state)
+
+    @JITModMethod
+    @TCompileBaseline
+    def forward(self, x, last_state: TimeMixState):
+        k, v, sr = self._forward_kvsr(x, last_state)
+        y, new_wkv_state = wkv_op(self.time_decay, self.time_first,
+                                  k, v, last_state.wkv_state)
+        return self._forward_out(sr, y, x[:, -1], new_wkv_state)
 
 
 ########################################################################################################
 
 
-class RWKV_ChannelMix(MyModule):
+class RWKV_ChannelMix(JITModClass):
 
     def __init__(self, layer_id, n_layer, n_embd, dim_ffn):
         super().__init__()
@@ -172,7 +280,8 @@ class RWKV_ChannelMix(MyModule):
         self.receptance = nn.Linear(n_embd, n_embd, bias=False)
         self.value = nn.Linear(dim_ffn, n_embd, bias=False)
 
-    @MyFunction
+    @JITModMethod
+    @TCompileMax
     def forward(self, x, last_state: ChannelMixState):
         xx = torch.concat((last_state.shift_state.unsqueeze(1), x[:, :-1]),
                           dim=1)
@@ -186,9 +295,8 @@ class RWKV_ChannelMix(MyModule):
 
 
 ########################################################################################################
-# The RWKV Model with our blocks
+# The RWKV Model blocks
 ########################################################################################################
-
 
 class Block(nn.Module):
 
@@ -225,6 +333,14 @@ class L2Wrap(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, loss, y, token_amount, currentMask):
+        # Currently (8th July 2023), save_for_backward, causes an issue with
+        # pytorch.compile (see: https://github.com/pytorch/pytorch/blob/e600505e3209eaf539e8bc99870ea55236cefbf5/torch/_dynamo/variables/higher_order_ops.py#L735)
+        # 
+        # Due to L2Wrap being a major hotspot, we should monitor this for future support.
+        # so that once its resolved, we can include the L2Wrap step in the torch.compile path
+        #
+        # See also:
+        # - checkpointed_step
         ctx.save_for_backward(y)
         ctx.token_amount = token_amount
         ctx.currentMask = currentMask
@@ -242,7 +358,17 @@ class L2Wrap(torch.autograd.Function):
         gy = gy * ctx.currentMask[:, None][None, :]
         return (grad_output, gy, None, None)
 
+########################################################################################################
+# Static optimized functions
+########################################################################################################
 
+# @ TCompileMax (no speed improvement)
+# def F_cross_entropy_reduction_none_optimized(logits, targets):
+#     return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction="none")
+
+########################################################################################################
+# Core RWKV module
+########################################################################################################
 class RWKV(L.LightningModule):
 
     def __init__(self,
@@ -262,13 +388,19 @@ class RWKV(L.LightningModule):
                  beta2: float = 0.99,
                  adam_eps: float = 1.0e-08,
                  weight_decay: float = 0.01,
+                 bptt_learning: bool = True,
+                 bptt_learning_range: int = -1,
+                 bptt_truncated_learning: bool = False,
                  layerwise_lr: bool = True,
                  dim_att: Optional[int] = None,
                  dim_ffn: Optional[int] = None,
                  load_model: Optional[str] = None,
-                 torch_set_float32_matmul_precision:str = None
+                 torch_set_float32_matmul_precision:str = 'high',
+                 substep_cuda_cache_clear: bool = False,
+                 substep_logging: bool = False
                  ):
         super().__init__()
+
         self.ctx_len = ctx_len
         self.ctx_len_cutoffs = ctx_len_cutoffs
         self.ctx_len_warmup_steps = ctx_len_warmup_steps
@@ -285,6 +417,11 @@ class RWKV(L.LightningModule):
         self.beta2 = beta2
         self.weight_decay = weight_decay
         self.adam_eps = adam_eps
+        self.bptt_learning = bptt_learning
+        self.bptt_learning_range = bptt_learning_range
+        self.bptt_truncated_learning = bptt_truncated_learning
+        self.substep_cuda_cache_clear = substep_cuda_cache_clear
+        self.substep_logging = substep_logging
 
         dim_att = dim_att or n_embd
         dim_ffn = dim_ffn or n_embd * 4
@@ -315,6 +452,17 @@ class RWKV(L.LightningModule):
         self.load_state_dict(torch.load(load_model, map_location='cpu'))
 
     def configure_optimizers(self):
+        if self.bptt_learning == False:
+            if self.deepspeed_stage >= 2 or self.deepspeed_offload:
+                print(f"[WARNING]: it is highly recommended to enable bptt_learning when used to deepspeed 2/3/offloading, otherwise an exception will occur when training with dataset records, larger then the configured context length ({self.ctx_len})")
+        else:
+            if self.trainer.num_devices > 1:
+                if self.bptt_learning_range <= 0:
+                    print("[WARNING]: unlimited bptt_learning_range across multiple GPU's has a performance penalty with datasets of mixed sizes due to its constant need to keep all GPU's in sync (consider using bptt_learning_range=1 instead)")
+                if self.bptt_learning_range > 1:
+                    # Temporary error, till better sync logic is done for mixed document sizes
+                    # (lazy to support this right now, since i have no idea if anyone has a use for it)
+                    raise NotImplementedError("bptt_learning_range > 1 is not supported yet")
         if self.layerwise_lr:
             lr_1x = set()
             lr_2x = set()
@@ -402,7 +550,7 @@ class RWKV(L.LightningModule):
                 'optimizer': optimizer,
                 'lr_scheduler': lr_scheduler,
             }
-        
+
         else:
             # Skip the lr_scheduler process if lr_init and lr_final are the same
             if starting_lr == ending_lr:
@@ -469,8 +617,14 @@ class RWKV(L.LightningModule):
         if max_epochs > 0:
             return estimated_stepping_batches // max_epochs
 
+        # Get the train_dataloader
+        train_dataloader = self.trainer.train_dataloader
+        if train_dataloader is None:
+            train_dataloader = self.trainer.fit_loop._data_source.dataloader()
+
         # Max epoch is not set, use the train_dataloader
-        dataset_size = len(self.trainer.train_dataloader)
+        dataset_size = len(train_dataloader)
+
         num_devices = max(1, self.trainer.num_devices)
         num_steps = dataset_size // (self.trainer.accumulate_grad_batches * num_devices)
         return num_steps
@@ -482,7 +636,16 @@ class RWKV(L.LightningModule):
             cfg = strategy.config["zero_optimization"]
             return "offload_optimizer" in cfg or "offload_parameters" in cfg
         return False
+    
+    @property
+    def deepspeed_stage(self) -> int:
+        strategy = self.trainer.strategy
+        if isinstance(strategy, DeepSpeedStrategy):
+            cfg = strategy.config["zero_optimization"]
+            return "stage" in cfg
+        return -1
 
+    @TCompileBaseline
     def forward(self, idx: torch.Tensor, last_shift_states: torch.Tensor,
                 last_wkv_states: torch.Tensor):
         B, T = idx.size()
@@ -492,11 +655,19 @@ class RWKV(L.LightningModule):
 
         new_states = BlockStateList.empty(self.n_layer, B, self.n_embd,
                                           x.device, x.dtype)
-        for i, (block, last_state) in enumerate(
-                zip(self.blocks,
-                    BlockStateList(last_shift_states, last_wkv_states))):
+        # Avoid using the zip operation, as torch.compile throws an exception on it
+        # with `zip not reconized as a valid function`
+        # ---
+        # for i, (block, last_state) in enumerate(
+        #         zip(self.blocks,
+        #             BlockStateList(last_shift_states, last_wkv_states))):
+        # ---
+        bs_list = BlockStateList(last_shift_states, last_wkv_states)
+        for i in range(len(self.blocks)):
+            block = self.blocks[i]
+            last_state = bs_list[i]
             if self.grad_cp:
-                x, new_state = deepspeed.checkpointing.checkpoint(
+                x, new_state = deepspeed_checkpoint(
                     block, x, last_state)
             else:
                 x, new_state = block(x, last_state)
@@ -508,7 +679,50 @@ class RWKV(L.LightningModule):
 
         return x, new_states.shift_states, new_states.wkv_states
 
-    def compute_loss(self, batch, batch_idx, do_cutoff: bool):
+    #
+    # Custom overwrite of manual_backwards operation, to skip the "manual_backwards"
+    # safety check, so we can perform manual backward operation step, while using
+    # the default trainer loop. This is modified from the original code found here:
+    # https://github.com/Lightning-AI/lightning/blob/37c244f94be365496def82870b22c2faf0ab889e/src/lightning/pytorch/core/module.py#L999
+    #
+    # ---
+    # 
+    # This allow us to avoid disabling the "automatic_optimization" flag
+    #
+    # Which would have been required to do "segmented learning", or "Backpropagation Through Time"
+    # where we would need to implement manual optimization as per
+    # https://lightning.ai/docs/pytorch/stable/model/manual_optimization.html
+    #
+    # Otherwise an error will be thrown if we call `self.manual_backward`
+    #
+    # However this would mean that we would need to do a full reimplementation
+    # of several features that were handled by the automatic optimization.
+    # - accumulate_grad_batches
+    # - gradient_clip_val
+    # - logging behaviour
+    # - distributed training co-ordination
+    # - (And probably other features that I am not aware of)
+    #
+    # So this is a hacky work around, to avoid reimplementing all of the above.
+    # 
+    # From the current code implementatiion, it seem like this is blocked only by 
+    # automatic_optimization flag - and has no adverse side effect otherwise
+    # https://lightning.ai/docs/pytorch/stable/_modules/lightning/pytorch/core/module.html#LightningModule.manual_backward
+    #
+    # If anyone have a better idea, let me know
+    # (have experimented with, reimplementing the above, but it is not trivial, unfortunately)
+    #
+    def manual_backward(self, loss: torch.Tensor, *args, **kwargs):
+        if self._fabric:
+            self._fabric.backward(loss, *args, **kwargs)
+        else:
+            # self._verify_is_manual_optimization("manual_backward")
+            self.trainer.strategy.backward(loss, None, *args, **kwargs)
+
+    #
+    # Main compute_loss function, this is called by the trainer loop
+    #
+    def compute_loss(self, batch, batch_idx, is_training_run: bool):
         seq = batch['input_ids']
         assert isinstance(seq, torch.Tensor) and seq.ndim == 2
         seq_mask = batch['attention_mask']
@@ -517,10 +731,20 @@ class RWKV(L.LightningModule):
         if seq_mask is None or seq_mask.ndim != 2:
             seq_mask = torch.ones_like(seq[:, 1:])
 
-        if do_cutoff:
+        # Perform cutoff for training run
+        if is_training_run:
             prev_step = 0
-            for step, len_cut in zip(self.ctx_len_warmup_steps,
-                                     self.ctx_len_cutoffs):
+
+            # Avoid using the zip operation, as torch.compile throws an exception on it
+            # with `zip not reconized as a valid function`
+            # ---
+            # for step, len_cut in zip(self.ctx_len_warmup_steps,
+            #                          self.ctx_len_cutoffs):
+            # ---
+            for i in range(min(len(self.ctx_len_warmup_steps), len(self.ctx_len_cutoffs))):
+                step = self.ctx_len_warmup_steps[i]
+                len_cut = self.ctx_len_cutoffs[i]
+
                 if prev_step <= self.global_step < step and len_cut < seq.shape[
                         1] - 1:
                     pos = randint(0, seq.shape[1] - len_cut - 1)
@@ -535,38 +759,34 @@ class RWKV(L.LightningModule):
                     seq_mask[:, :pos] = 0
                     break
                 prev_step = step
-
+                
+        do_bptt_learning = self.bptt_learning and is_training_run
         idx, targets = seq[:, :-1], seq[:, 1:]
 
         B, T = idx.shape
         C = self.n_embd
         total_mask_sum = torch.sum(seq_mask)
 
+        # If total_mask_sum, we skip, as there is no tokens of value to learn from anyway
+        if total_mask_sum == 0:
+            return 0
+        
         def checkpointed_step(idx, targets, mask, prev_loss, last_shift_states,
                               last_wkv_states, prev_steps):
             logits, new_shift_states, new_wkv_states = self(
                 idx, last_shift_states, last_wkv_states)
+            
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                   targets.view(-1),
-                                   reduction="none")
+                                    targets.view(-1),
+                                    reduction="none")
+
             submask = mask.view(-1)[:loss.shape[0]]
             submask_sum = torch.sum(submask)
+            loss = torch.sum(loss * submask) / total_mask_sum  
 
-            # Special handling of empty mask
-            # (possible when real_ctx_len is larger then ctx_len, which results into 'chunking')
-            if submask_sum == 0:
-                loss = torch.sum(loss * submask) / 1
-                loss = L2Wrap.apply(loss, logits, total_mask_sum, submask)
-                new_steps = prev_steps  # + submask_sum
-                new_loss = prev_loss + loss
-            else:
-                # Handling with mask
-                loss = torch.sum(loss * submask) / submask_sum
-                loss = L2Wrap.apply(loss, logits, total_mask_sum, submask)
-                new_steps = prev_steps + submask_sum
-                new_loss = prev_loss * (prev_steps / new_steps) + loss * (
-                    1 - prev_steps / new_steps)
-
+            loss = L2Wrap.apply(loss, logits, total_mask_sum, submask)
+            new_steps = prev_steps + submask_sum
+            new_loss = prev_loss + loss
             return new_loss, new_shift_states, new_wkv_states, new_steps
 
         total_loss = torch.tensor(
@@ -574,36 +794,179 @@ class RWKV(L.LightningModule):
         steps = 0
         states = BlockStateList.create(self.n_layer, B, C, seq.device,
                                        self.emb.weight.dtype)
-        for i in range(math.ceil(T / self.ctx_len)):
-            if i != math.ceil(T / self.ctx_len) - 1:
-                total_loss, new_shift_states, new_wkv_states, steps = deepspeed.checkpointing.checkpoint(
-                    checkpointed_step,
-                    idx[:, i * self.ctx_len:(i + 1) * self.ctx_len],
-                    targets[:, i * self.ctx_len:(i + 1) * self.ctx_len],
-                    seq_mask[:, i * self.ctx_len:(i + 1) * self.ctx_len],
-                    total_loss,
-                    states.shift_states,
-                    states.wkv_states,
-                    steps,
-                )
+        segment_count = math.ceil(T / self.ctx_len)
+
+        #
+        # BPTT learning, we split the sequence into segments
+        # and perform a backward pass for each segment, on its own.
+        #
+        # Allowing us to perform backpropagation across context sizes much larger
+        # then what is supported by the current GPU memory.
+        #
+        # This reduces the need for the checkpointing process, and mitigate
+        # a known error where multiple backwards pass throws an exception.
+        #
+        # While not mathematically equivalent to full context size learning,
+        # it makes "infctx" size training possible with deepspeed 2/3
+        #
+        # ---
+        # 
+        # See the following, for more details on "Gradient computed twice" error:
+        # https://github.com/microsoft/DeepSpeed/issues/988#issuecomment-1549417269
+        #
+        # Other possibly related issues on the topic:
+        # https://github.com/microsoft/DeepSpeed/pull/677
+        # https://github.com/EleutherAI/gpt-neox/issues/62#issuecomment-766366413
+        #
+        if do_bptt_learning:
+
+            gradient_accumulation_steps = max(1, self.trainer.accumulate_grad_batches)
+            optimizer = self.optimizers()
+            cur_device = self.device
+            
+            # We use the average segment size, instead of ctx length size.
+            # this helps ensure that the segment cutoffs do not make the last segment too small.
+            # (eg, the last chunk having only 1 token)
+            #
+            # it also helps ensure the segment cutoff points are more varied, across mixed dataset sizes
+            # and avoid potentially undesired training behaviour at fixed cutoff points
+            # (this only applies for segmented learning)
+            segment_size = min(math.ceil(T / segment_count), self.ctx_len)
+
+            # We compute when we start the segmented learning process
+            if self.bptt_learning_range > 0:
+                first_learning_segment = segment_count - self.bptt_learning_range;
             else:
-                total_loss, new_shift_states, new_wkv_states, steps = checkpointed_step(
-                    idx[:, i * self.ctx_len:(i + 1) * self.ctx_len],
-                    targets[:, i * self.ctx_len:(i + 1) * self.ctx_len],
-                    seq_mask[:, i * self.ctx_len:(i + 1) * self.ctx_len],
-                    total_loss,
-                    states.shift_states,
-                    states.wkv_states,
+                first_learning_segment = 0;
+
+            # Dummy 2D tenros of shape [1,1], are used to do "dummy checkpoint/forward/backprop" to keep everything in sync
+            dummy_2d_zero = torch.tensor([[0]], dtype=torch.long, device=cur_device)
+
+            # Get the max segment count across all GPUs, in the current batch, which is used to keep all devices are in sync
+            # Once a thread has completed all its segments, it will do dummy checkpoint/forward/backprop with one token,
+            # and stay in sync with the thread that are still working on their segments
+            #
+            # This is used to work around an undocumented behaviour for either lightning / deepspeed loss.backward multi-gpu handling
+            # where the `self.manual_backward()` / `loss.backward()` call will block / freeze / hang when being too "out of sync"
+            #
+            # This can be viewed as a form of `fabric.barrier()` which is invoked implicitly by each `self.manual_backward()` call
+            # except that it isn't exactly a `fabric.barrier()` - because it does not block immediately and instead blocks in 
+            # the next `self.manual_backward()` call if the previous ones are too far out of sync. 
+            # (its confusing, but makes sense for efficency)
+            #
+            # Additionally because the "code line position" and params actually matter for the 'barrier' code effect,
+            # we cant work around this issue by doing dummy `self.manual_backward()` calls, in another if/else branch or loop
+            #
+            # Combined, this makes this issue very hard to trace and debug, as it will manifest itself as randomly "freezing"
+            # when out of sync during `self.manual_backward()` calls. Without the current work around put in place
+            #
+            # We only do this, if we are doing bptt learning on more then 1 segment, and gpu count > 1
+            # otherwise we just use the segment count as it is
+            if self.trainer.num_devices > 1 and (self.bptt_learning_range > 1 or self.bptt_learning_range <= 0):
+                shared_segment_count = self.trainer.getFabric().all_reduce(segment_count, reduce_op="max").item()
+            else:
+                shared_segment_count = segment_count
+
+            # Lets go through all the segments (including dummy ones)
+            for i in range(shared_segment_count):
+                # Apply state truncation, if truncated learning is enabled
+                # this limits the backprop process, reduces loss learning rate, 
+                # but save vram across extreamly large backpropagation steps
+                if self.bptt_truncated_learning:
+                    prv_shift_states = states.shift_states.clone().detach().requires_grad_(False)
+                    prv_wkv_states = states.wkv_states.clone().detach().requires_grad_(False)
+                else:
+                    prv_shift_states = states.shift_states
+                    prv_wkv_states = states.wkv_states
+                
+                # We use a dummy masked token 0, to do additional dummy checkpoint/forward/backprop when needed
+                # for each additional call after the current "segment_count" max
+                if i <= segment_count - 1:
+                    cur_idx = idx[:, i * segment_size:(i + 1) * segment_size]
+                    cur_tar = targets[:, i * segment_size:(i + 1) * segment_size]
+                    cur_msk = seq_mask[:, i * segment_size:(i + 1) * segment_size]
+                else:
+                    cur_idx = dummy_2d_zero
+                    cur_tar = dummy_2d_zero
+                    cur_msk = dummy_2d_zero
+
+                # Segmented learning, applies the forward/pass over each chunk seperately
+                segment_loss, new_shift_states, new_wkv_states, steps = checkpointed_step(
+                    cur_idx,
+                    cur_tar,
+                    cur_msk,
+                    torch.tensor(0, dtype=self.emb.weight.dtype, device=cur_device).requires_grad_(True),
+                    prv_shift_states,
+                    prv_wkv_states,
                     steps,
                 )
-            states = BlockStateList(new_shift_states, new_wkv_states)
-            gc.collect()
-            # torch.cuda.empty_cache()
+                states = BlockStateList(new_shift_states, new_wkv_states)
+                
+                # Compute the backward pass for the segment
+                if i >= first_learning_segment:
+                    # The learning loss, should be normalized against the accumulation steps
+                    # as we are bypassing the pytorch lightning normalization
+                    # https://lightning.ai/docs/pytorch/2.0.4/common/lightning_module.html#backward
+                    learning_loss = segment_loss / gradient_accumulation_steps
+
+                    # Perform the backward pass accordingly
+                    if i < shared_segment_count-1:
+                        # Undocumented multiple backward pass support
+                        # https://github.com/Lightning-AI/lightning/blob/678f642808c54e4c490caee4df5d357301c976bb/tests/trainer/optimization/test_manual_optimization.py#L251
+                        self.manual_backward(learning_loss, optimizer, retain_graph=True)
+
+                        # Accumulate without gradient, as we already did the backward pass
+                        total_loss = total_loss + segment_loss.clone().detach().requires_grad_(False)
+                    else:
+                        # This is the last pass, we let the default pytorch lightning handle the backward pass
+                        # and return the segment loss as part of the total loss
+                        total_loss = total_loss + segment_loss
+                else:
+                    # Even if its not the segments we use for backward pass, we need to accumulate the loss
+                    total_loss = total_loss + segment_loss.clone().detach().requires_grad_(False)
+
+                # GC collect unused memory
+                gc.collect()
+                # torch.cuda.empty_cache()
+        else:
+
+            # Normal operations without BPTT
+            segment_size = self.ctx_len
+            for i in range(segment_count):
+                if i < segment_count-1:
+                    total_loss, new_shift_states, new_wkv_states, steps = deepspeed_checkpoint(
+                        checkpointed_step,
+                        idx[:, i * segment_size:(i + 1) * segment_size],
+                        targets[:, i * segment_size:(i + 1) * segment_size],
+                        seq_mask[:, i * segment_size:(i + 1) * segment_size],
+                        total_loss,
+                        states.shift_states,
+                        states.wkv_states,
+                        steps,
+                    )
+                else:
+                    total_loss, new_shift_states, new_wkv_states, steps = checkpointed_step(
+                        idx[:, i * segment_size:(i + 1) * segment_size],
+                        targets[:, i * segment_size:(i + 1) * segment_size],
+                        seq_mask[:, i * segment_size:(i + 1) * segment_size],
+                        total_loss,
+                        states.shift_states,
+                        states.wkv_states,
+                        steps,
+                    )
+
+                states = BlockStateList(new_shift_states, new_wkv_states)
+                gc.collect()
+                # torch.cuda.empty_cache()
 
         # Wandb logging only, if an active run exists
         if wandb.run is not None:
+            global_rank = self.global_rank
+            global_device_count = self.trainer.num_devices * self.trainer.num_nodes
             wandb.log({
-                'substep': batch_idx, 
+                'substep': batch_idx * global_device_count + global_rank,
+                'batchidx': batch_idx,
+                'global_rank': global_rank, 
                 'real_ctx_len': T, 
                 'train/loss': total_loss,
                 'trainer/global_step':self.global_step,
@@ -612,11 +975,22 @@ class RWKV(L.LightningModule):
 
         return total_loss
 
+    @TCompileBaseline
     def training_step(self, batch, batch_idx):
         total_loss = self.compute_loss(batch, batch_idx, True)
+
         self.log('train/loss', total_loss, prog_bar=True)
+        # If set - forces the above train/loss log line to always be on a new line
+        if self.substep_logging:
+            print("")
+        
+        if self.substep_cuda_cache_clear:
+            gc.collect()
+            torch.cuda.empty_cache()
+
         return total_loss
 
+    @TCompileBaseline
     def validation_step(self, batch, batch_idx):
         total_loss = self.compute_loss(batch, batch_idx, False)
         self.log('validation/loss', total_loss, prog_bar=True, sync_dist=True)

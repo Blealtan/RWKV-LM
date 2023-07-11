@@ -59,7 +59,7 @@ def prepare_data_static(**kargs):
         # Tokenized encodings for multi column keys
         multi_column_enabled = len(multi_column_keys) > 0
         multi_column_prefix_encodings = []
-        multi_column_seperator_encodings = None
+        multi_column_separator_encodings = None
 
         # Process the multi column settings
         if multi_column_enabled:
@@ -69,9 +69,9 @@ def prepare_data_static(**kargs):
             # Tokenize the multi column strings
             for i in range(len(multi_column_keys)):
                 multi_column_prefix_encodings.append(tokenizer(multi_column_prefix[i]))
-            # Tokenize the multi column seperator
+            # Tokenize the multi column separator
             if multi_column_separator is not None and len(multi_column_separator) > 0:
-                multi_column_seperator_encodings = tokenizer(multi_column_separator)
+                multi_column_separator_encodings = tokenizer(multi_column_separator)
         
         # Maps the dataset record to the tokenized result
         # handles a wide variety of format according to the data configuration
@@ -112,11 +112,11 @@ def prepare_data_static(**kargs):
                     for i in range(len(multi_column_keys)):
                         # And process the column if it has data
                         if multi_column_keys[i] in x and x[multi_column_keys[i]] is not None and len(x[multi_column_keys[i]]) > 0:
-                            # Add the seperator if this is not the first item
-                            if not is_first_item and multi_column_seperator_encodings is not None:
-                                input_ids += multi_column_seperator_encodings['input_ids']
-                                token_type_ids += multi_column_seperator_encodings['token_type_ids']
-                                attention_mask += multi_column_seperator_encodings['attention_mask']
+                            # Add the separator if this is not the first item
+                            if not is_first_item and multi_column_separator_encodings is not None:
+                                input_ids += multi_column_separator_encodings['input_ids']
+                                token_type_ids += multi_column_separator_encodings['token_type_ids']
+                                attention_mask += multi_column_separator_encodings['attention_mask']
                             
                             # Add the prefix
                             input_ids += multi_column_prefix_encodings[i]['input_ids']

@@ -3,7 +3,7 @@ seed_everything: 3941088705
 trainer:
   # Configure the number of GPU, avaliable on your machine
   accelerator: gpu
-  devices: 1
+  devices: auto
   num_nodes: 1
 
   #
@@ -35,7 +35,7 @@ trainer:
   logger:
     class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
-      name: 'infctx-validation-full (matmul=medium, train-ctx=1024, data-ctx=1024, bs=12)'
+      name: 'infctx-torch-compile-perf'
       project: 'RWKV-infctx-validation'
       tags: ['RWKV', 'infctx']
       id: null
@@ -79,7 +79,7 @@ trainer:
       # which will create a `rwkv_model.pth` in the checkpoint directory.
       #
       # Do not use the `zero_to_fp32.py` script as that will have export format issues
-      dirpath: ../checkpoint/trainer-validaiton/matmul-medium
+      dirpath: ../checkpoint/trainer-validaiton/infctx-validation-torch-perf
       filename: null
       
       # Save the top/last K checkpoints
@@ -118,9 +118,9 @@ trainer:
   # Generally what you want to configure is the maximum number of epochs
   # Leave it as -1, and it will keep going forever till interrupted
   # Or set it as a number, and it will stop after that number of epochs
-  max_epochs: 1
+  max_epochs: -1
   min_epochs: null
-  max_steps: -1
+  max_steps: 100
   min_steps: null
   max_time: null
 
@@ -136,7 +136,7 @@ trainer:
   #
   # You are also recommended to configure this to a large enough number to fully utilize
   # your GPU processing time %, and avoid idle time for the GPU between batches
-  accumulate_grad_batches: 12
+  accumulate_grad_batches: 10
 
   # Various other settings, you probably want to leave alone
   fast_dev_run: false
@@ -189,16 +189,8 @@ model:
   # This allows the training of extreamly large context length (eg. 100k),
   # without eating up too much vram by keeping the training context length
   # to a resonable number sutible to the current GPU setup
-  ctx_len: 1024
+  ctx_len: 4096
   
-  # Data samples would be cut down to the respective max ctx_len_cutoffs
-  # values if its larger then ctx_len. If the data sample is larger then
-  # the largest len_cutoff, the remaining data will be discarded
-  ctx_len_cutoffs: [1024, 2048, 4096, 8192, 16384, 32768, 65536]
-  # Experimental settings, number of tokens to skip in the data sample
-  # prefix, for the respective cutoff length. Used to speed up the process
-  ctx_len_warmup_steps: [0, 0, 0, 0, 0, 0, 0]
-
   # Learning rate of the training process
   # ---
   # Initia learning rate of the process
@@ -224,11 +216,6 @@ model:
   adam_eps: 1.0e-08
   weight_decay: 0.01
 
-  # torch.set_float32_matmul_precision, used to optimize operations with tensor cores
-  # this should be set as null, for non cuda core GPUs
-  torch_set_float32_matmul_precision: 'medium'
-  # torch_set_float32_matmul_precision: null
-
   # Segmented based learning, used to work around training of large context length
   # beyond what can be supported by the current GPU vram architecture
   #
@@ -242,6 +229,28 @@ model:
   # -1 means to apply for all segments
   bptt_learning_range: -1
 
+  # Force each substep to be logged as a seperate line
+  substep_logging: true
+
+  # Experimental cutoff settings
+  # ---
+  # Data samples would be cut down to the respective max ctx_len_cutoffs
+  # values if its larger then ctx_len. If the data sample is larger then
+  # the largest len_cutoff, the remaining data will be discarded
+  #
+  # Leave it as a blank array to disable the feature
+  ctx_len_cutoffs: []
+  # Experimental settings, number of tokens to skip in the data sample
+  # prefix, for the respective cutoff length. Used to speed up the process
+  #
+  # Leave it as a blank array to disable the feature
+  ctx_len_warmup_steps: []
+
+  # torch.set_float32_matmul_precision, used to optimize operations with tensor cores
+  # this should be set as null, for non cuda core GPUs
+  torch_set_float32_matmul_precision: 'high'
+  # torch_set_float32_matmul_precision: null
+
   # various other settings you probably should leave alone
   grad_cp: true
   warmup_steps: -1
@@ -254,7 +263,7 @@ data:
   # Use this if you have built your own dataset and saved it with `save_to_disk()`
   # with source left as null. Other wise configure this to a directory which the 
   # dataset will be built and tokenized by the huggingface dataset process.
-  data_path: ../datapath/enwiki_10k_1024/
+  data_path: ../datapath/enwiki_10k_4096/
 
   # Other wise provide the source path, which is used as huggingface dataset path
   # this will be used to populate the dataset_path
@@ -302,7 +311,7 @@ data:
   # This is ignored, if source is not set as text
   # This is ignored, if set to zero
   # ---
-  text_rechunk_size: 1024
+  text_rechunk_size: 4096
 
   # Apply text rechunk to the dataset, even if its not a 'text' source
   # This is done only after dataset filtering, and if source is not 'text'
@@ -325,7 +334,7 @@ data:
   # multi_column_keys: ['instruction', 'input', 'output']
   # multi_column_prefix: ['Instruction:\n', 'Input:\n', 'Output:\n']
   # multi_column_masking: [false, true, false]
-  # multi_column_seperator: '\n\n'
+  # multi_column_separator: '\n\n'
 
   # If processing prompt/completion jsonl pairs, the prompt is masked by default
   # use this flag to disable this default behaviour
@@ -335,5 +344,5 @@ data:
 # Path to the current checkpoint to continue training from
 # Enable this to the last checkpoint after the first run 
 # (if it crash and you want to resume)
-# ckpt_path: ../checkpoint/trainer-validaiton/infctx-validation-dryrun/epoch=0-step=20.ckpt
+# ckpt_path: ../checkpoint/trainer-validaiton/infctx-validation-baseline/epoch=0-step=20.ckpt
 ckpt_path: null

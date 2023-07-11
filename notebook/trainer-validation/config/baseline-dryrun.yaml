@@ -3,7 +3,7 @@ seed_everything: 3941088705
 trainer:
   # Configure the number of GPU, avaliable on your machine
   accelerator: gpu
-  devices: 1
+  devices: auto
   num_nodes: 1
 
   #
@@ -240,7 +240,7 @@ model:
   # Segmented range to performing backprop learning on
   # 1 means to apply only for the last segment
   # -1 means to apply for all segments
-  bptt_learning_range: 2
+  bptt_learning_range: -1
 
   # various other settings you probably should leave alone
   grad_cp: true
@@ -325,7 +325,7 @@ data:
   # multi_column_keys: ['instruction', 'input', 'output']
   # multi_column_prefix: ['Instruction:\n', 'Input:\n', 'Output:\n']
   # multi_column_masking: [false, true, false]
-  # multi_column_seperator: '\n\n'
+  # multi_column_separator: '\n\n'
 
   # If processing prompt/completion jsonl pairs, the prompt is masked by default
   # use this flag to disable this default behaviour

@@ -153,6 +153,10 @@ datapath/
 checkpoint/
 node_modules/
 
+# We do capture the notebook generated .log files
+# as they are meant to be read as reference
+!notebook/**/*.log
+
 # Ignore generated lightning logs and config files
 */lightning_logs/
 */config.yaml

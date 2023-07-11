@@ -31,20 +31,33 @@ The following features are not yet supported (that may exist in [blinks original
 ## Environment setup
 
 The following venv setup using conda, modify for your use case respectively
-```
+```bash
 # ninja-build is required for the new trainer
 sudo apt-get install ninja-build
 
-# Virtual env, with python 3.11
+# Update conda & its package listings
+conda update conda
+
+# Virtual env, with python 3.10
+# python 3.11 have issues with torch.compile / h100s
+# and if you want to use 3.11, you will need to do a nightly build install
 conda create -n rwkv-infctx python=3.11 pip
 conda activate rwkv-infctx
 
-# Install pytorch
-conda install -y pytorch torchvision torchaudio pytorch-cuda=11.7 -c pytorch -c nvidia
+# Install pytorch (>=2.0.1)
+conda install -y pytorch==2.0.1 torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia
+
+# Currently for torch.compile + 3.11 to work, for some paltforms, you will need the nightly build
+# if so you may need to try the following instead
+# ---
+# conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch-nightly -c nvidia
+
+# Verify your pytorch version 
+python -c "import torch; print(torch.__version__)"
 
 # We use python -m pip, instead of pip directly, as it resolve issues with venv not loading the right pip
 python -m pip install datasets transformers 
-python -m pip install lightning==2.0.2 deepspeed==0.9.3 
+python -m pip install lightning==2.0.4 deepspeed==0.9.5
 python -m pip install ninja numexpr jsonargparse 'jsonargparse[signatures]'
 python -m pip install lm-dataformat ftfy sentencepiece tokenizers wandb
 ```
